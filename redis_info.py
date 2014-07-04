@@ -27,53 +27,18 @@
 #   http://collectd.org/documentation/manpages/collectd-python.5.shtml
 
 import collectd
-import socket
+import redis
 
-
-# Host to connect to. Override in config by specifying 'Host'.
-REDIS_HOST = 'localhost'
-
-# Port to connect on. Override in config by specifying 'Port'.
-REDIS_PORT = 6379
-
-# Password to use for authentication.  Override in config by specifying 'Pass'.
-REDIS_PASS = None
 
 # Verbose logging on/off. Override in config by specifying 'Verbose'.
 VERBOSE_LOGGING = False
 
+REDIS_NODES = dict()
 
-def fetch_info():
+def fetch_info(node):
     """Connect to Redis server and request info"""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((REDIS_HOST, REDIS_PORT))
-        log_verbose('Connected to Redis at %s:%s' % (REDIS_HOST, REDIS_PORT))
-    except socket.error, e:
-        collectd.error('redis_info plugin: Error connecting to %s:%d - %r'
-                       % (REDIS_HOST, REDIS_PORT, e))
-        return None
-    fp = s.makefile('r')
-    if REDIS_PASS:
-      s.sendall('auth %s\r\n' % REDIS_PASS)
-      response = fp.readline()
-      if response.startswith('OK'):
-        log_verbose('redis_info plugin: Authenticated')
-      else:
-        collectd.error('redis_info plugin: Failed to authenticate')
-        return None
-    log_verbose('Sending info command')
-    s.sendall('info\r\n')
-
-    status_line = fp.readline()
-    content_length = int(status_line[1:-1]) # status_line looks like: $<content_length>
-    data = fp.read(content_length)
-    log_verbose('Received data: %s' % data)
-    s.close()
-
-    linesep = '\r\n' if '\r\n' in data else '\n'
-    return parse_info(data.split(linesep))
-
+    c = redis.Redis(connection_pool=node['pool'])
+    return c.info()
 
 def parse_info(info_lines):
     """Parse info response from Redis"""
@@ -105,23 +70,25 @@ def parse_info(info_lines):
 
 def configure_callback(conf):
     """Receive configuration block"""
-    global REDIS_HOST, REDIS_PORT, REDIS_PASS, VERBOSE_LOGGING
+    global VERBOSE_LOGGING, REDIS_NODES
     for node in conf.children:
-        if node.key == 'Host':
-            REDIS_HOST = node.values[0]
-        elif node.key == 'Port':
-            REDIS_PORT = int(node.values[0])
-        elif node.key == 'Password':
-            REDIS_PASS = node.values[0]
+        if node.key == 'Node':
+            new_node = {'host': 'localhost', 'port': 6379}
+            REDIS_NODES[node.values[0]] = new_node
+            for param in node.children:
+                if param.key == 'Host': new_node['host'] = param.values[0]
+                if param.key == 'Port': new_node['port'] = int(param.values[0])
+                if param.key == 'Password': new_node['password'] = param.values[0]
+            new_node['pool'] = redis.ConnectionPool(host=new_node['host'], port=new_node['port'])
+            log_verbose('Configured with host=%s, port=%s' % (new_node['host'], new_node['port']))
         elif node.key == 'Verbose':
             VERBOSE_LOGGING = bool(node.values[0])
         else:
             collectd.warning('redis_info plugin: Unknown config key: %s.'
                              % node.key)
-    log_verbose('Configured with host=%s, port=%s' % (REDIS_HOST, REDIS_PORT))
 
 
-def dispatch_value(info, key, type, type_instance=None):
+def dispatch_value(info, node, key, type, type_instance=None):
     """Read a key from info response data and dispatch a value"""
     if key not in info:
         collectd.warning('redis_info plugin: Info key not found: %s' % key)
@@ -134,6 +101,7 @@ def dispatch_value(info, key, type, type_instance=None):
     log_verbose('Sending value: %s=%s' % (type_instance, value))
 
     val = collectd.Values(plugin='redis_info')
+    val.plugin_instance = node
     val.type = type
     val.type_instance = type_instance
     val.values = [value]
@@ -142,31 +110,31 @@ def dispatch_value(info, key, type, type_instance=None):
 
 def read_callback():
     log_verbose('Read callback called')
-    info = fetch_info()
+    for node_name, node in REDIS_NODES.iteritems():
+        info = fetch_info(node)
 
-    if not info:
-        collectd.error('redis plugin: No info received')
-        return
+        if not info:
+            collectd.error('redis plugin: No info received')
+            return
+        # send high-level values
+        dispatch_value(info, node_name, 'uptime_in_seconds','gauge')
+        dispatch_value(info, node_name, 'connected_clients', 'gauge')
+        dispatch_value(info, node_name, 'connected_slaves', 'gauge')
+        dispatch_value(info, node_name, 'blocked_clients', 'gauge')
+        dispatch_value(info, node_name, 'evicted_keys', 'gauge')
+        dispatch_value(info, node_name, 'used_memory', 'bytes')
+        dispatch_value(info, node_name, 'changes_since_last_save', 'gauge')
+        dispatch_value(info, node_name, 'total_connections_received', 'counter',
+                       'connections_received')
+        dispatch_value(info, node_name, 'total_commands_processed', 'counter',
+                       'commands_processed')
 
-    # send high-level values
-    dispatch_value(info, 'uptime_in_seconds','gauge')
-    dispatch_value(info, 'connected_clients', 'gauge')
-    dispatch_value(info, 'connected_slaves', 'gauge')
-    dispatch_value(info, 'blocked_clients', 'gauge')
-    dispatch_value(info, 'evicted_keys', 'gauge')
-    dispatch_value(info, 'used_memory', 'bytes')
-    dispatch_value(info, 'changes_since_last_save', 'gauge')
-    dispatch_value(info, 'total_connections_received', 'counter',
-                   'connections_received')
-    dispatch_value(info, 'total_commands_processed', 'counter',
-                   'commands_processed')
-
-    # database and vm stats
-    for key in info:
-        if key.startswith('vm_stats_'):
-            dispatch_value(info, key, 'gauge')
-        if key.startswith('db'):
-            dispatch_value(info[key], 'keys', 'gauge', '%s-keys' % key)
+        # database and vm stats
+        for key in info:
+            if key.startswith('vm_stats_'):
+                dispatch_value(info, node_name, key, 'gauge')
+            if key.startswith('db'):
+                dispatch_value(info[key], node_name, 'keys', 'gauge', '%s-keys' % key)
 
 
 def log_verbose(msg):
