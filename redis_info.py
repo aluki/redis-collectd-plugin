@@ -79,6 +79,12 @@ def configure_callback(conf):
                 if param.key == 'Host': new_node['host'] = param.values[0]
                 if param.key == 'Port': new_node['port'] = int(param.values[0])
                 if param.key == 'Password': new_node['password'] = param.values[0]
+                if param.key == 'Keys': 
+                    if not 'keys' in new_node: new_node['keys'] = list()
+                    for val in param.values: new_node['keys'].append(val)
+                if param.key == 'Dbs': 
+                    if not 'dbs' in new_node: new_node['dbs'] = list()
+                    for val in param.values: new_node['dbs'].append(val)
             new_node['pool'] = redis.ConnectionPool(host=new_node['host'], port=new_node['port'])
             log_verbose('Configured with host=%s, port=%s' % (new_node['host'], new_node['port']))
         elif node.key == 'Verbose':
@@ -117,25 +123,18 @@ def read_callback():
             collectd.error('redis plugin: No info received')
             return
         # send high-level values
-        dispatch_value(info, node_name, 'uptime_in_seconds','gauge')
-        dispatch_value(info, node_name, 'connected_clients', 'gauge')
-        dispatch_value(info, node_name, 'connected_slaves', 'gauge')
-        dispatch_value(info, node_name, 'blocked_clients', 'gauge')
-        dispatch_value(info, node_name, 'evicted_keys', 'gauge')
-        dispatch_value(info, node_name, 'used_memory', 'bytes')
-        dispatch_value(info, node_name, 'changes_since_last_save', 'gauge')
-        dispatch_value(info, node_name, 'total_connections_received', 'counter',
-                       'connections_received')
-        dispatch_value(info, node_name, 'total_commands_processed', 'counter',
-                       'commands_processed')
-
-        # database and vm stats
-        for key in info:
-            if key.startswith('vm_stats_'):
-                dispatch_value(info, node_name, key, 'gauge')
-            if key.startswith('db'):
-                dispatch_value(info[key], node_name, 'keys', 'gauge', '%s-keys' % key)
-
+        if 'keys' in node:
+            for key in node['keys']:
+                if ':' in key: k,t = key.split(':')
+                else: k,t = key, 'gauge'
+                dispatch_value(info, node_name, k, t)
+        if 'dbs' in node:
+            for db in node['dbs']:
+               if isinstance(db, float) or not db.startswith('db'): db = 'db{0}'.format(int(db))
+               if not db in info: collectd.error('redis plugin: database {0} not found in data'.format(db))
+               else:
+                   for k,v in info[db].iteritems():
+                       dispatch_value(info[db], node_name, k, 'gauge', '{0}-{1}'.format(db,k))
 
 def log_verbose(msg):
     if not VERBOSE_LOGGING:
